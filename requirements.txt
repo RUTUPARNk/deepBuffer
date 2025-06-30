@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+numpy
+zstandard
+websockets
+multiprocessing-logging
+psutil
+pycuda
+cupy-cuda12x
+numba
+jax
+websocket-client
+requests 
