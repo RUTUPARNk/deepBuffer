@@ -10,15 +10,17 @@ from logger import ThreadLogger, ProcessLogger
 import uvicorn
 import psutil
 import os
+from transactional_checkpoint import CheckpointManager
 
 
 class DashboardServer:
     """Real-time dashboard server for monitoring the shared memory pipeline."""
     
-    def __init__(self, logger: ProcessLogger, host: str = "0.0.0.0", port: int = 8000):
+    def __init__(self, logger: ProcessLogger, host: str = "0.0.0.0", port: int = 8000, checkpoint_manager: Optional[CheckpointManager] = None):
         self.logger = logger
         self.host = host
         self.port = port
+        self.checkpoint_manager = checkpoint_manager
         
         # FastAPI app
         self.app = FastAPI(title="Shared Memory Pipeline Dashboard")
@@ -50,6 +52,14 @@ class DashboardServer:
             "queue_sizes": [],
             "buffer_usage": [],
             "timestamps": []
+        }
+        
+        # Checkpoint status
+        self.checkpoint_status = {
+            "last_checkpoint_time": None,
+            "version": None,
+            "interval": None,
+            "saving": False
         }
         
         # Setup routes
@@ -101,6 +111,68 @@ class DashboardServer:
             """Get historical data for charts."""
             return self.historical_data
         
+        @self.app.get("/api/checkpoint-info")
+        async def get_checkpoint_info():
+            """Get real-time checkpoint info for dashboard."""
+            info = self.checkpoint_manager.get_last_checkpoint_info() if self.checkpoint_manager else None
+            return {
+                "last_checkpoint_time": info["timestamp"] if info else None,
+                "version": info["version"] if info else None,
+                "interval": self.checkpoint_status["interval"],
+                "saving": self.checkpoint_status["saving"]
+            }
+        
+        @self.app.get("/api/activity-heatmap")
+        async def get_activity_heatmap():
+            """Get thread and process activity heatmap data for visualization."""
+            # Thread heatmap
+            thread_stats = self.logger.get_all_thread_stats()
+            process_stats = self.logger.get_all_process_stats()
+            # For each thread/process, collect a time series of idle_percentage or cpu_usage
+            thread_heatmap = []
+            for tid, stats in thread_stats.items():
+                thread_heatmap.append({
+                    "thread_id": tid,
+                    "idle_percentage": stats.get("idle_percentage", 0),
+                    "cpu_usage": stats.get("avg_cpu_usage", 0),
+                    "history": []  # Optionally, add more detailed history if available
+                })
+            process_heatmap = []
+            for pid, stats in process_stats.items():
+                process_heatmap.append({
+                    "process_id": pid,
+                    "idle_percentage": stats.get("idle_percentage", 0),
+                    "cpu_usage": stats.get("avg_cpu_usage", 0),
+                    "history": []  # Optionally, add more detailed history if available
+                })
+            return {
+                "thread_heatmap": thread_heatmap,
+                "process_heatmap": process_heatmap
+            }
+        
+        @self.app.get("/api/throughput-history")
+        async def get_throughput_history():
+            """Get per-thread and per-process throughput history for advanced graphs."""
+            thread_history = self.logger.get_thread_throughput_history()
+            process_history = self.logger.get_process_throughput_history()
+            return {
+                "thread_throughput": thread_history,
+                "process_throughput": process_history
+            }
+        
+        @self.app.get("/api/buffer-usage-history")
+        async def get_buffer_usage_history():
+            """Get detailed buffer usage history for buffer usage charts."""
+            # If self.buffer_manager exists, use it; else, return dummy data
+            try:
+                history = self.buffer_manager.get_full_usage_history(300)  # last 5 min
+            except AttributeError:
+                # Dummy data: 100 points, sine wave
+                import math, time as t
+                now = t.time()
+                history = [(now - 100 + i, 10 + int(5*math.sin(i/10)), 10 + int(5*math.cos(i/10)), 20) for i in range(100)]
+            return {"history": history}
+        
         @self.app.websocket("/ws/status")
         async def websocket_status(websocket: WebSocket):
             """WebSocket endpoint for real-time status updates."""
@@ -109,9 +181,16 @@ class DashboardServer:
             
             try:
                 while True:
-                    # Send periodic updates
                     await asyncio.sleep(1)
                     status_data = self._get_comprehensive_status()
+                    # Add checkpoint info
+                    checkpoint_info = self.checkpoint_manager.get_last_checkpoint_info() if self.checkpoint_manager else None
+                    status_data["checkpoint_info"] = {
+                        "last_checkpoint_time": checkpoint_info["timestamp"] if checkpoint_info else None,
+                        "version": checkpoint_info["version"] if checkpoint_info else None,
+                        "interval": self.checkpoint_status["interval"],
+                        "saving": self.checkpoint_status["saving"]
+                    }
                     await websocket.send_text(json.dumps(status_data))
             except WebSocketDisconnect:
                 self.active_connections.remove(websocket)
@@ -624,6 +703,31 @@ class DashboardServer:
             </div>
         </div>
 
+        <!-- Thread/Process Activity Heatmap -->
+        <div class="metric-card mb-6">
+            <h3 class="text-lg font-semibold mb-4">🔥 Thread/Process Activity Heatmap</h3>
+            <div id="activityHeatmap" class="overflow-x-auto">
+                <!-- Heatmap will be rendered here -->
+            </div>
+        </div>
+
+        <!-- Advanced Throughput Graphs -->
+        <div class="metric-card mb-6">
+            <h3 class="text-lg font-semibold mb-4">📈 Advanced Throughput Graphs</h3>
+            <div class="flex gap-4 mb-2">
+                <button id="showThreadThroughput" class="control-button">Thread Throughput</button>
+                <button id="showProcessThroughput" class="control-button">Process Throughput</button>
+            </div>
+            <div class="chart-container" style="height:300px">
+                <canvas id="advancedThroughputChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Buffer Usage Chart -->
+        <div class="metric-card mb-6">
+            <h3 class="text-lg font-semibold mb-4">🧮 Buffer Usage Over Time</h3>
+            <div class="chart-container" style="height:300px">
+                <canvas id="bufferUsageChart"></canvas>
         <!-- Charts -->
         <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
             <!-- Compression Ratio Chart -->
@@ -660,6 +764,8 @@ class DashboardServer:
         // Charts
         let compressionChart = null;
         let throughputChart = null;
+        let advancedThroughputChart = null;
+        let throughputMode = 'thread';
         
         function initializeCharts() {
             const compressionCtx = document.getElementById('compressionChart').getContext('2d');
@@ -966,6 +1072,79 @@ class DashboardServer:
             }
         });
         
+        // Advanced Throughput Graphs
+        function setupAdvancedThroughputChart() {
+            const ctx = document.getElementById('advancedThroughputChart').getContext('2d');
+            advancedThroughputChart = new Chart(ctx, {
+                type: 'line',
+                data: { labels: [], datasets: [] },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: true } },
+                    scales: { y: { beginAtZero: true } }
+                }
+            });
+        }
+        async function fetchThroughputHistory() {
+            try {
+                const response = await fetch('/api/throughput-history');
+                if (!response.ok) return;
+                const data = await response.json();
+                updateAdvancedThroughputChart(data);
+            } catch (e) {}
+        }
+        function updateAdvancedThroughputChart(data) {
+            if (!advancedThroughputChart) return;
+            let datasets = [];
+            let labels = [];
+            if (throughputMode === 'thread') {
+                // Each thread is a dataset
+                Object.entries(data.thread_throughput).forEach(([tid, history], idx) => {
+                    const color = `hsl(${(idx*47)%360},70%,50%)`;
+                    const points = history.map(([ts, val]) => ({x: new Date(ts*1000), y: val}));
+                    datasets.push({
+                        label: `Thread ${tid}`,
+                        data: points,
+                        borderColor: color,
+                        backgroundColor: color + '22',
+                        tension: 0.3,
+                        pointRadius: 0
+                    });
+                });
+            } else {
+                // Each process is a dataset
+                Object.entries(data.process_throughput).forEach(([pid, history], idx) => {
+                    const color = `hsl(${(idx*67)%360},70%,50%)`;
+                    const points = history.map(([ts, val]) => ({x: new Date(ts*1000), y: val}));
+                    datasets.push({
+                        label: `Process ${pid}`,
+                        data: points,
+                        borderColor: color,
+                        backgroundColor: color + '22',
+                        tension: 0.3,
+                        pointRadius: 0
+                    });
+                });
+            }
+            // Set labels to time axis
+            advancedThroughputChart.data.labels = [];
+            advancedThroughputChart.data.datasets = datasets;
+            advancedThroughputChart.options.scales.x = { type: 'time', time: { unit: 'second' } };
+            advancedThroughputChart.update('none');
+        }
+        document.getElementById('showThreadThroughput').addEventListener('click', () => {
+            throughputMode = 'thread';
+            fetchThroughputHistory();
+        });
+        document.getElementById('showProcessThroughput').addEventListener('click', () => {
+            throughputMode = 'process';
+            fetchThroughputHistory();
+        });
+        setupAdvancedThroughputChart();
+        setInterval(fetchThroughputHistory, 2000);
+        fetchThroughputHistory();
+        
         // Initialize
         initializeCharts();
         connectWebSocket();
@@ -982,6 +1161,53 @@ class DashboardServer:
                 }
             }
         }, 5000);
+
+        // Heatmap rendering
+        function renderHeatmap(data) {
+            const container = document.getElementById('activityHeatmap');
+            if (!container) return;
+            let html = '';
+            // Thread heatmap
+            if (data.thread_heatmap && data.thread_heatmap.length > 0) {
+                html += '<div class="mb-2 font-semibold">Threads</div>';
+                html += '<table class="min-w-full text-xs mb-4"><thead><tr><th>ID</th><th>Idle %</th><th>CPU %</th></tr></thead><tbody>';
+                data.thread_heatmap.forEach(row => {
+                    const idle = row.idle_percentage || 0;
+                    const cpu = row.cpu_usage || 0;
+                    const color = idle > 70 ? '#10b981' : idle > 30 ? '#f59e0b' : '#ef4444';
+                    html += `<tr style="background:${color}22"><td class="px-2">${row.thread_id}</td><td class="px-2">${idle.toFixed(1)}%</td><td class="px-2">${cpu.toFixed(1)}%</td></tr>`;
+                });
+                html += '</tbody></table>';
+            }
+            // Process heatmap
+            if (data.process_heatmap && data.process_heatmap.length > 0) {
+                html += '<div class="mb-2 font-semibold">Processes</div>';
+                html += '<table class="min-w-full text-xs"><thead><tr><th>ID</th><th>Idle %</th><th>CPU %</th></tr></thead><tbody>';
+                data.process_heatmap.forEach(row => {
+                    const idle = row.idle_percentage || 0;
+                    const cpu = row.cpu_usage || 0;
+                    const color = idle > 70 ? '#10b981' : idle > 30 ? '#f59e0b' : '#ef4444';
+                    html += `<tr style="background:${color}22"><td class="px-2">${row.process_id}</td><td class="px-2">${idle.toFixed(1)}%</td><td class="px-2">${cpu.toFixed(1)}%</td></tr>`;
+                });
+                html += '</tbody></table>';
+            }
+            container.innerHTML = html;
+        }
+
+        // Periodically fetch and update heatmap
+        async function fetchHeatmap() {
+            try {
+                const response = await fetch('/api/activity-heatmap');
+                if (response.ok) {
+                    const data = await response.json();
+                    renderHeatmap(data);
+                }
+            } catch (e) {
+                // Ignore errors
+            }
+        }
+        setInterval(fetchHeatmap, 2000);
+        fetchHeatmap();
     </script>
 </body>
 </html>
@@ -1020,6 +1246,10 @@ class DashboardServer:
             port=self.port,
             log_level="info"
         )
+
+    def notify_checkpoint_saving(self, saving: bool):
+        """Set visual indicator for checkpoint saving."""
+        self.checkpoint_status["saving"] = saving
 
 
 def create_dashboard_server(logger: ProcessLogger, host: str = "0.0.0.0", port: int = 8000) -> DashboardServer:

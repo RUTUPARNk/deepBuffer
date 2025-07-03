@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 import psutil
 import pickle
+from tensor_buffer_manager import TensorBufferManager
 
 
 @dataclass
@@ -115,10 +116,10 @@ class SharedMemoryManager:
 class ProducerProcess:
     """Process that generates or reads matrices and puts them into shared buffers."""
     
-    def __init__(self, shared_memory_manager: SharedMemoryManager, 
+    def __init__(self, tensor_manager: TensorBufferManager, 
                  output_queue: Queue, task_queue: Queue, 
                  buffer_return_queue: Queue, process_id: int):
-        self.shm_manager = shared_memory_manager
+        self.tensor_manager = tensor_manager
         self.output_queue = output_queue
         self.task_queue = task_queue
         self.buffer_return_queue = buffer_return_queue
@@ -161,7 +162,7 @@ class ProducerProcess:
         
         try:
             # Get available buffer
-            buffer_id = self.shm_manager.get_available_buffer()
+            buffer_id = self.tensor_manager.acquire_tensor()
             if not buffer_id:
                 print(f"Producer {self.process_id}: No available buffers")
                 return
@@ -170,7 +171,7 @@ class ProducerProcess:
             matrix = self._generate_matrix(task)
             
             # Create NumPy array in shared memory
-            array = self.shm_manager.create_numpy_array(
+            array = self.tensor_manager.create_numpy_array(
                 buffer_id, matrix.shape, str(matrix.dtype)
             )
             
@@ -211,7 +212,7 @@ class ProducerProcess:
             print(f"Error processing task in producer {self.process_id}: {e}")
             # Return buffer if we got one
             if 'buffer_id' in locals():
-                self.shm_manager.return_buffer(buffer_id)
+                self.tensor_manager.release_tensor(buffer_id)
     
     def _generate_matrix(self, task: Dict) -> np.ndarray:
         """Generate a matrix based on task parameters."""
@@ -232,7 +233,7 @@ class ProducerProcess:
         try:
             while not self.buffer_return_queue.empty():
                 buffer_id = self.buffer_return_queue.get_nowait()
-                self.shm_manager.return_buffer(buffer_id)
+                self.tensor_manager.release_tensor(buffer_id)
                 print(f"Producer {self.process_id}: Buffer {buffer_id} returned for reuse")
         except:
             pass
@@ -256,9 +257,9 @@ class ProducerProcess:
 class CompressorProcess:
     """Process that compresses matrices from shared buffers."""
     
-    def __init__(self, shared_memory_manager: SharedMemoryManager,
+    def __init__(self, tensor_manager: TensorBufferManager,
                  input_queue: Queue, output_queue: Queue, process_id: int):
-        self.shm_manager = shared_memory_manager
+        self.tensor_manager = tensor_manager
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.process_id = process_id
@@ -305,7 +306,7 @@ class CompressorProcess:
             metadata = data["metadata"]
             
             # Get NumPy array from shared memory
-            array = self.shm_manager.create_numpy_array(
+            array = self.tensor_manager.create_numpy_array(
                 buffer_id, metadata.shape, metadata.dtype
             )
             
@@ -371,10 +372,10 @@ class CompressorProcess:
 class WriterProcess:
     """Process that writes compressed data to disk."""
     
-    def __init__(self, shared_memory_manager: SharedMemoryManager,
+    def __init__(self, tensor_manager: TensorBufferManager,
                  input_queue: Queue, buffer_return_queue: Queue, 
                  output_dir: str, process_id: int):
-        self.shm_manager = shared_memory_manager
+        self.tensor_manager = tensor_manager
         self.input_queue = input_queue
         self.buffer_return_queue = buffer_return_queue
         self.output_dir = output_dir
@@ -502,7 +503,11 @@ class SharedMemoryPipeline:
         self.output_dir = output_dir
         
         # Shared memory manager
-        self.shm_manager = SharedMemoryManager(max_buffers, buffer_size_mb)
+        self.tensor_manager = TensorBufferManager(
+            num_buffers=max_buffers,
+            tensor_shape=(buffer_size_mb * 256,),  # Example shape, adjust as needed
+            dtype=np.float32
+        )
         
         # Queues for inter-process communication
         self.producer_compressor_queue = Queue(maxsize=50)
@@ -530,7 +535,7 @@ class SharedMemoryPipeline:
         # Start producer processes
         for i in range(self.num_producers):
             producer = ProducerProcess(
-                self.shm_manager, self.producer_compressor_queue, 
+                self.tensor_manager, self.producer_compressor_queue, 
                 self.task_queue, self.buffer_return_queue, i
             )
             process = mp.Process(target=producer.run, name=f"Producer-{i}")
@@ -541,7 +546,7 @@ class SharedMemoryPipeline:
         # Start compressor processes
         for i in range(self.num_compressors):
             compressor = CompressorProcess(
-                self.shm_manager, self.producer_compressor_queue, 
+                self.tensor_manager, self.producer_compressor_queue, 
                 self.compressor_writer_queue, i
             )
             process = mp.Process(target=compressor.run, name=f"Compressor-{i}")
@@ -552,7 +557,7 @@ class SharedMemoryPipeline:
         # Start writer processes
         for i in range(self.num_writers):
             writer = WriterProcess(
-                self.shm_manager, self.compressor_writer_queue, 
+                self.tensor_manager, self.compressor_writer_queue, 
                 self.buffer_return_queue, self.output_dir, i
             )
             process = mp.Process(target=writer.run, name=f"Writer-{i}")
@@ -574,7 +579,7 @@ class SharedMemoryPipeline:
         
         return {
             "pipeline_status": "running" if self.running else "stopped",
-            "buffer_info": self.shm_manager.get_buffer_info(),
+            "buffer_info": self.tensor_manager.get_buffer_info(),
             "queue_sizes": {
                 "task_queue": self.task_queue.qsize(),
                 "producer_compressor_queue": self.producer_compressor_queue.qsize(),
@@ -603,6 +608,6 @@ class SharedMemoryPipeline:
                     process.kill()
         
         # Cleanup shared memory
-        self.shm_manager.cleanup()
+        self.tensor_manager.cleanup()
         
         print("Shared Memory Pipeline stopped") 

@@ -2,7 +2,7 @@ import time
 import threading
 import psutil
 import json
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict, deque
 import statistics
@@ -108,6 +108,8 @@ class ThreadLogger:
         self.monitoring_active = True
         self.monitor_thread = threading.Thread(target=self._monitor_threads, daemon=True)
         self.monitor_thread.start()
+        
+        self.thread_throughput_history: Dict[int, deque] = defaultdict(lambda: deque(maxlen=max_history))
     
     def log_thread_start(self, thread_id: int, task_id: Optional[str] = None):
         """Log when a thread starts working on a task."""
@@ -143,6 +145,15 @@ class ThreadLogger:
             
             if thread_id in self.thread_activities:
                 self._end_thread_activity(thread_id, current_time)
+            
+            # Update throughput history
+            if thread_id in self.thread_history:
+                activities = list(self.thread_history[thread_id])
+                if activities:
+                    total_activities = len(activities)
+                    total_duration = sum(a.duration or 0 for a in activities)
+                    throughput = total_activities / total_duration if total_duration > 0 else 0.0
+                    self.thread_throughput_history[thread_id].append((current_time, throughput))
             
             # Update task if provided
             if task_id and task_id in self.tasks:
@@ -334,6 +345,11 @@ class ThreadLogger:
         self.monitoring_active = False
         if self.monitor_thread.is_alive():
             self.monitor_thread.join(timeout=5)
+    
+    def get_thread_throughput_history(self) -> Dict[int, List[Tuple[float, float]]]:
+        """Return per-thread throughput history as {thread_id: [(timestamp, throughput), ...]}"""
+        with self.lock:
+            return {tid: list(hist) for tid, hist in self.thread_throughput_history.items()}
 
 
 class ProcessLogger(ThreadLogger):
@@ -364,6 +380,10 @@ class ProcessLogger(ThreadLogger):
         # WebSocket update data
         self.last_websocket_update = time.time()
         self.websocket_update_interval = 1.0  # 1 second
+        
+        self.last_checkpoint_event: Optional[Dict[str, Any]] = None
+        
+        self.process_throughput_history: Dict[int, deque] = defaultdict(lambda: deque(maxlen=max_history))
     
     def log_process_start(self, process_id: int, process_name: str, task_id: Optional[str] = None):
         """Log when a process starts working on a task."""
@@ -403,6 +423,15 @@ class ProcessLogger(ThreadLogger):
             
             if process_id in self.process_activities:
                 self._end_process_activity(process_id, current_time)
+            
+            # Update throughput history
+            if process_id in self.process_history:
+                activities = list(self.process_history[process_id])
+                if activities:
+                    total_activities = len(activities)
+                    total_duration = sum(a.duration or 0 for a in activities)
+                    throughput = total_activities / total_duration if total_duration > 0 else 0.0
+                    self.process_throughput_history[process_id].append((current_time, throughput))
             
             # Update task if provided
             if task_id and task_id in self.tasks:
@@ -609,6 +638,15 @@ class ProcessLogger(ThreadLogger):
                 "overall_stats": self.get_overall_stats()
             }
     
+    def log_checkpoint_event(self, event: str, info: Optional[Dict[str, Any]] = None):
+        """Log a checkpoint save event for dashboard."""
+        self.last_checkpoint_event = {
+            "event": event,
+            "info": info,
+            "timestamp": time.time()
+        }
+        self.log_error('INFO', f'Checkpoint event: {event}, info: {info}')
+    
     def get_websocket_update_data(self) -> Dict:
         """Get data for WebSocket updates."""
         current_time = time.time()
@@ -628,13 +666,15 @@ class ProcessLogger(ThreadLogger):
         # Get error logs
         error_logs = list(self.error_logs)[-10:]  # Last 10 errors
         
-        return {
+        update = {
             "timestamp": current_time,
             "pipeline_stats": pipeline_stats,
             "system_metrics": system_metrics.__dict__ if system_metrics else {},
             "error_logs": error_logs,
-            "update_interval": self.websocket_update_interval
+            "update_interval": self.websocket_update_interval,
+            "checkpoint_event": self.last_checkpoint_event,
         }
+        return update
     
     def export_process_logs(self, filename: str):
         """Export process logs to a JSON file."""
@@ -688,4 +728,9 @@ class ProcessLogger(ThreadLogger):
             }
             
             with open(filename, 'w') as f:
-                json.dump(export_data, f, indent=2) 
+                json.dump(export_data, f, indent=2)
+    
+    def get_process_throughput_history(self) -> Dict[int, List[Tuple[float, float]]]:
+        """Return per-process throughput history as {process_id: [(timestamp, throughput), ...]}"""
+        with self.lock:
+            return {pid: list(hist) for pid, hist in self.process_throughput_history.items()} 

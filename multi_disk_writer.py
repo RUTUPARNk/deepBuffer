@@ -8,6 +8,7 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
 import math
+from logger import ProcessLogger
 
 
 class DiskShard:
@@ -509,4 +510,68 @@ class RAIDWriter:
     def shutdown(self):
         """Shutdown the RAID writer."""
         self.write_pool.shutdown(wait=True)
-        print("RAID writer shutdown complete") 
+        print("RAID writer shutdown complete")
+
+
+class MultiDiskWriter:
+    """
+    Writes compressed buffers to multiple files/disks in parallel.
+    Supports round-robin and load-aware file selection, tracks per-file write speeds, and logs disk I/O stats.
+    """
+    def __init__(self, output_paths: List[str], logger: ProcessLogger):
+        self.output_paths = output_paths
+        self.logger = logger
+        self.file_locks: Dict[str, threading.Lock] = {p: threading.Lock() for p in output_paths}
+        self.file_write_stats: Dict[str, List[float]] = {p: [] for p in output_paths}
+        self.file_offsets: Dict[str, int] = {p: 0 for p in output_paths}
+        self.metadata: List[Tuple[str, int, int]] = []  # (file, offset, length)
+        self.rr_index = 0
+        self.lock = threading.Lock()
+
+    def write_buffer(self, buffer: bytes, use_load_aware: bool = False) -> Tuple[str, int, int]:
+        """
+        Write a buffer to a selected file. Returns (file, offset, length) for metadata.
+        """
+        if use_load_aware:
+            file_path = self._select_file_load_aware()
+        else:
+            file_path = self._select_file_round_robin()
+        with self.file_locks[file_path]:
+            offset = self.file_offsets[file_path]
+            start = time.time()
+            with open(file_path, 'ab') as f:
+                f.write(buffer)
+            elapsed = time.time() - start
+            self.file_offsets[file_path] += len(buffer)
+            self.file_write_stats[file_path].append(len(buffer) / max(elapsed, 1e-6))
+            self.metadata.append((file_path, offset, len(buffer)))
+            # Log disk I/O
+            self.logger.log_write_speed(hash(file_path), len(buffer) / max(elapsed, 1e-6))
+            return file_path, offset, len(buffer)
+
+    def _select_file_round_robin(self) -> str:
+        with self.lock:
+            file_path = self.output_paths[self.rr_index % len(self.output_paths)]
+            self.rr_index += 1
+            return file_path
+
+    def _select_file_load_aware(self) -> str:
+        # Select file with highest recent write speed
+        with self.lock:
+            best_file = self.output_paths[0]
+            best_speed = 0.0
+            for p in self.output_paths:
+                speeds = self.file_write_stats[p][-10:] if self.file_write_stats[p] else [0.0]
+                avg_speed = sum(speeds) / len(speeds)
+                if avg_speed > best_speed:
+                    best_speed = avg_speed
+                    best_file = p
+            return best_file
+
+    def get_metadata(self) -> List[Tuple[str, int, int]]:
+        """Get metadata for reassembly."""
+        return self.metadata
+
+    def get_file_stats(self) -> Dict[str, float]:
+        """Get per-file average write speeds."""
+        return {p: (sum(self.file_write_stats[p]) / len(self.file_write_stats[p]) if self.file_write_stats[p] else 0.0) for p in self.output_paths} 
