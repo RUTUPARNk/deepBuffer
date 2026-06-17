@@ -2,6 +2,12 @@
 
 A high-performance, GIL-bypassing shared memory pipeline for ultra-scale matrix processing with real-time telemetry and monitoring.
 
+> This README covers the core shared-memory pipeline. For the advanced modules
+> (GPU compression, RAID-style multi-disk writes, thread migration, fast indexed
+> reader, WAL + checkpoints, process supervisor, tensor buffer manager) see
+> [README_ENHANCED.md](README_ENHANCED.md). The benchmark/throughput numbers in
+> the docs are illustrative targets, not measured results.
+
 ## 🚀 Overview
 
 This project implements a fully parallel matrix processing pipeline using `multiprocessing.shared_memory` to bypass Python's GIL and achieve true parallel processing. The pipeline consists of:
